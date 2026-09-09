@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(NOT TARGET agent_runtime::agent_runtime)
+  include("${CMAKE_CURRENT_LIST_DIR}/agent_runtimeTargets.cmake")
+endif()
+
+set(agent_runtime_VERSION "@PROJECT_VERSION@")
+set(agent_runtime_VERSION_MAJOR "@PROJECT_VERSION_MAJOR@")
+set(agent_runtime_VERSION_MINOR "@PROJECT_VERSION_MINOR@")
+set(agent_runtime_VERSION_PATCH "@PROJECT_VERSION_PATCH@")
+
+check_required_components(agent_runtime)
