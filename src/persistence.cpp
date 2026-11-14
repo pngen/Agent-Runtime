@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 
@@ -152,6 +153,26 @@ class Reader {
     offset_ += size;
     return value;
   }
+  /// Free text the runtime accepts without the identifier string limit: action
+  /// input (bounded by the payload limit), failure messages, caller-supplied
+  /// reasons, provenance and digests. It is bounded by the document, which save()
+  /// never writes above the persistence limit, so every saved state loads.
+  std::string free_text() {
+    const std::uint32_t size = u32();
+    if (!ok_) {
+      return {};
+    }
+    if (size > limits_.max_persistence_bytes) {
+      fail("text exceeds the configured persistence limit");
+      return {};
+    }
+    if (!need(size)) {
+      return {};
+    }
+    std::string value(reinterpret_cast<const char*>(data_.data() + offset_), size);
+    offset_ += size;
+    return value;
+  }
   std::vector<std::uint64_t> u64_vector() {
     const std::uint32_t count = u32();
     if (!ok_) {
@@ -228,8 +249,8 @@ MemoryBinding read_binding(Reader& reader) {
   binding.read_authority = reader.boolean();
   binding.write_authority = reader.boolean();
   binding.fresh = reader.boolean();
-  binding.provenance = reader.text();
-  binding.digest = reader.text();
+  binding.provenance = reader.free_text();
+  binding.digest = reader.free_text();
   return binding;
 }
 
@@ -858,9 +879,9 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         state.lifecycle = static_cast<RuntimeLifecycle>(lifecycle);
         state.cancellation = static_cast<CancellationState>(cancellation);
         state.recovery = static_cast<RecoveryStatus>(recovery);
-        state.terminal_reason = record.text();
-        state.cancellation_reason = record.text();
-        state.recovery_reason = record.text();
+        state.terminal_reason = record.free_text();
+        state.cancellation_reason = record.free_text();
+        state.recovery_reason = record.free_text();
         state.run_id = AgentRunId(record.u64());
         state.run_generation = AgentRunGeneration(record.u64());
         state.current_run_index = record.u32();
@@ -908,7 +929,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         state.budget.limits_known = record.boolean();
         state.budget.expires_at_unix_millis = static_cast<UnixMillis>(record.u64());
         state.budget.observed_at_unix_millis = static_cast<UnixMillis>(record.u64());
-        state.budget.provenance = record.text();
+        state.budget.provenance = record.free_text();
         state.mutation_sequence = record.u64();
         break;
       }
@@ -921,7 +942,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         run.committed_actions = record.u64();
         run.steps = record.u32();
         run.terminal = record.boolean();
-        run.terminal_reason = record.text();
+        run.terminal_reason = record.free_text();
         run.started_at_unix_millis = static_cast<UnixMillis>(record.u64());
         run.ended_at_unix_millis = static_cast<UnixMillis>(record.u64());
         state.runs.push_back(std::move(run));
@@ -974,7 +995,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         action.model_target = record.text();
         action.tool_name = record.text();
         action.operation_key = record.text();
-        action.input = record.text();
+        action.input = record.free_text();
         action.input_digest = record.u64();
         action.max_output_bytes = record.u32();
         action.memory_binding_id = MemoryBindingId(record.u64());
@@ -1047,7 +1068,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
           return result;
         }
         action.last_failure = static_cast<RetryClass>(last_failure);
-        action.last_error = record.text();
+        action.last_error = record.free_text();
         action.result_digest = record.u64();
         action.completions_seen = record.u32();
         for (const std::uint64_t value : record.u64_vector()) {
@@ -1055,7 +1076,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         }
         action.requires_checkpoint = record.boolean();
         action.provenance.origin = record.text();
-        action.provenance.detail = record.text();
+        action.provenance.detail = record.free_text();
         action.provenance.recorded_at_unix_millis = static_cast<UnixMillis>(record.u64());
         action.declaration_sequence = record.u64();
         action.commit_sequence = record.u64();
@@ -1108,7 +1129,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         attempt.completion_recorded = record.boolean();
         attempt.dispatched_at_unix_millis = static_cast<UnixMillis>(record.u64());
         attempt.completed_at_unix_millis = static_cast<UnixMillis>(record.u64());
-        attempt.error = record.text();
+        attempt.error = record.free_text();
         state.attempts.push_back(std::move(attempt));
         break;
       }
@@ -1128,7 +1149,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         record_value.authority.lease_generation = record.u64();
         record_value.authority.current = record.boolean();
         record_value.current = record.boolean();
-        record_value.reason = record.text();
+        record_value.reason = record.free_text();
         record_value.recorded_at_unix_millis = static_cast<UnixMillis>(record.u64());
         state.assignments.push_back(std::move(record_value));
         break;
@@ -1139,7 +1160,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         binding.binding_generation = ModelCallGeneration(record.u64());
         binding.backend_id = BackendId(record.u64());
         binding.backend_generation = Generation<BackendTag>(record.u64());
-        binding.route_provenance = record.text();
+        binding.route_provenance = record.free_text();
         binding.current = record.boolean();
         state.model_bindings.push_back(std::move(binding));
         break;
@@ -1158,7 +1179,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         }
         binding.side_effect = static_cast<SideEffectClass>(side_effect);
         binding.max_input_bytes = record.u32();
-        binding.provenance = record.text();
+        binding.provenance = record.free_text();
         binding.current = record.boolean();
         state.tool_bindings.push_back(std::move(binding));
         break;
@@ -1181,8 +1202,8 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         checkpoint.binding.progress_generation = ProgressGeneration(record.u64());
         checkpoint.binding.memory_generation = MemoryBindingGeneration(record.u64());
         checkpoint.binding.checkpoint_identity = record.text();
-        checkpoint.binding.integrity_digest = record.text();
-        checkpoint.binding.provenance = record.text();
+        checkpoint.binding.integrity_digest = record.free_text();
+        checkpoint.binding.provenance = record.free_text();
         checkpoint.binding.restorable = record.boolean();
         checkpoint.binding.current = record.boolean();
         const std::uint16_t checkpoint_state = record.u16();
@@ -1200,7 +1221,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         FencedBootRecord fenced;
         fenced.runtime_boot_id = RuntimeBootId(record.u64());
         fenced.agent_boot_id = AgentBootId(record.u64());
-        fenced.reason = record.text();
+        fenced.reason = record.free_text();
         fenced.recorded_at_unix_millis = static_cast<UnixMillis>(record.u64());
         state.fenced_boots.push_back(std::move(fenced));
         break;
@@ -1241,7 +1262,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
           return result;
         }
         for (std::uint32_t i = 0; i < tool_count; ++i) {
-          policy.allowed_tools.insert(record.text());
+          policy.allowed_tools.insert(record.free_text());
         }
         const std::uint32_t target_count = record.u32();
         if (target_count > limits.max_collection_entries) {
@@ -1250,7 +1271,7 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
           return result;
         }
         for (std::uint32_t i = 0; i < target_count; ++i) {
-          policy.allowed_model_targets.insert(record.text());
+          policy.allowed_model_targets.insert(record.free_text());
         }
         policy.retry.max_attempts = record.u32();
         policy.retry.backoff_base_millis = record.u64();
@@ -1293,14 +1314,14 @@ DecodeResult decode_document(std::span<const std::uint8_t> bytes, const Resource
         evidence.limits_known = record.boolean();
         evidence.expires_at_unix_millis = static_cast<UnixMillis>(record.u64());
         evidence.observed_at_unix_millis = static_cast<UnixMillis>(record.u64());
-        evidence.provenance = record.text();
+        evidence.provenance = record.free_text();
         state.budget_history.push_back(std::move(evidence));
         break;
       }
       case kRecordProvenance: {
         Provenance provenance;
         provenance.origin = record.text();
-        provenance.detail = record.text();
+        provenance.detail = record.free_text();
         provenance.recorded_at_unix_millis = static_cast<UnixMillis>(record.u64());
         state.provenance_log.push_back(std::move(provenance));
         break;
@@ -1559,8 +1580,12 @@ bool atomic_write(const std::string& path, std::span<const std::uint8_t> bytes,
   if (!options.temporary_directory.empty()) {
     directory = options.temporary_directory;
   }
-  const std::string temporary = directory + "/.agent_runtime-" +
-                                std::to_string(static_cast<long>(getpid())) + ".tmp";
+  // The name is unique per process and per write: several runtimes of one
+  // process may save into the same directory at the same time.
+  static std::atomic<std::uint64_t> write_sequence{0};
+  const std::string temporary =
+      directory + "/.agent_runtime-" + std::to_string(static_cast<long>(getpid())) + "-" +
+      std::to_string(write_sequence.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
   const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (fd < 0) {
     error = "cannot create temporary file";

@@ -352,10 +352,11 @@ MutationResult AgentRuntime::Impl::finish(MutationResult result) {
 }
 
 MutationResult AgentRuntime::Impl::finish_locked(MutationResult result) {
-  if (is_acceptance(result.code)) {
-    bump();
-    mark_dirty();
-  }
+  // Every caller reaches this point after changing canonical state, whatever
+  // the outcome code says (an ambiguous or exhausted completion is recorded
+  // too). The sequence must move so that a racing save reports the change.
+  bump();
+  mark_dirty();
   return result;
 }
 
@@ -613,6 +614,69 @@ void AgentRuntime::Impl::classify_unresolved_locked(ActionRecord& action, Attemp
   action.last_error = attempt.error;
 }
 
+bool AgentRuntime::Impl::revive_for_admission_locked(ActionRecord& action,
+                                                     bool require_admitting_lifecycle) {
+  if (action.ambiguous) {
+    return false;
+  }
+  if (require_admitting_lifecycle && !can_admit(state.lifecycle)) {
+    return false;
+  }
+  if (active_action_count_locked() >= limits.max_active_actions) {
+    return false;
+  }
+  set_action_state_locked(action, ActionState::ADMITTED);
+  return true;
+}
+
+void AgentRuntime::Impl::hold_ambiguous_locked(ActionRecord& action, std::string reason) {
+  set_action_state_locked(action, ActionState::REVALIDATION_REQUIRED);
+  action.ambiguous = true;
+  action.completion_status = CompletionStatus::AMBIGUOUS;
+  action.last_failure = RetryClass::AMBIGUOUS_COMPLETION;
+  action.last_error = std::move(reason);
+  action.current_attempt = ActionAttemptId{};
+  action.current_attempt_generation = AttemptGeneration{};
+}
+
+void AgentRuntime::Impl::hold_unvalidated_completions_locked() {
+  for (ActionRecord& action : state.actions) {
+    if (action.state == ActionState::COMPLETED_UNVALIDATED &&
+        requires_reconciliation_on_ambiguity(action.side_effect)) {
+      hold_ambiguous_locked(action,
+                            "the side effect completed but its completion lost the process "
+                            "authority that could commit it");
+    }
+  }
+}
+
+void AgentRuntime::Impl::supersede_lost_work_locked(const std::string& reason) {
+  for (AttemptRecord& attempt : state.attempts) {
+    if (!is_in_flight(attempt.state)) {
+      continue;
+    }
+    attempt.superseded = true;
+    attempt.current = false;
+    set_attempt_state_locked(attempt, ActionState::REVALIDATION_REQUIRED);
+    attempt.error = reason;
+    const std::uint32_t index = detail::find_action(state, attempt.action_id);
+    if (index != kInvalidIndex &&
+        requires_reconciliation_on_ambiguity(state.actions[index].side_effect)) {
+      attempt.ambiguous = true;
+      attempt.completion_status = CompletionStatus::AMBIGUOUS;
+      hold_ambiguous_locked(state.actions[index], reason);
+    }
+  }
+  hold_unvalidated_completions_locked();
+  for (ActionRecord& action : state.actions) {
+    if (is_in_flight(action.state) || action.state == ActionState::COMPLETED_UNVALIDATED) {
+      set_action_state_locked(action, ActionState::REVALIDATION_REQUIRED);
+      action.current_attempt = ActionAttemptId{};
+      action.current_attempt_generation = AttemptGeneration{};
+    }
+  }
+}
+
 MutationResult AgentRuntime::Impl::mark_retry_pending_locked(ActionRecord& action,
                                                              AttemptRecord& attempt,
                                                              RetryClass failure_class,
@@ -716,17 +780,28 @@ AgentRuntime::~AgentRuntime() {
   impl_->backends.clear();
 }
 
-AgentRuntimeId AgentRuntime::id() const noexcept { return impl_->state.runtime_id; }
+AgentRuntimeId AgentRuntime::id() const noexcept {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->state.runtime_id;
+}
 
 AgentRuntimeGeneration AgentRuntime::generation() const noexcept {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->state.runtime_generation;
 }
 
-RuntimeBootId AgentRuntime::boot_id() const noexcept { return impl_->state.runtime_boot_id; }
+RuntimeBootId AgentRuntime::boot_id() const noexcept {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->state.runtime_boot_id;
+}
 
-RuntimeEpoch AgentRuntime::runtime_epoch() const noexcept { return impl_->state.runtime_epoch; }
+RuntimeEpoch AgentRuntime::runtime_epoch() const noexcept {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->state.runtime_epoch;
+}
 
 CoordinatorEpoch AgentRuntime::coordinator_epoch() const noexcept {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->state.coordinator_epoch;
 }
 
@@ -858,10 +933,13 @@ MutationResult AgentRuntime::bind_assignment(SchedulerAuthority authority) {
   detail::record_provenance(state, *impl_->clock, "bind_assignment",
                             "assignment " + std::to_string(authority.assignment_id.value()));
 
-  // Actions that were waiting on assignment authority become revalidatable.
+  // Actions that were waiting on assignment authority become revalidatable,
+  // within the admission rules: never while the runtime admits no work (a
+  // suspended runtime must keep no dispatchable action) and never beyond the
+  // active-action bound. The rest stay waiting for an explicit admission.
   for (ActionRecord& action : state.actions) {
-    if (action.state == ActionState::REVALIDATION_REQUIRED && !action.ambiguous) {
-      impl_->set_action_state_locked(action, ActionState::ADMITTED);
+    if (action.state == ActionState::REVALIDATION_REQUIRED) {
+      (void)impl_->revive_for_admission_locked(action, true);
     }
   }
 
@@ -875,15 +953,22 @@ MutationResult AgentRuntime::bind_assignment(SchedulerAuthority authority) {
 }
 
 MutationResult AgentRuntime::revalidate_assignment() {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  CanonicalState& state = impl_->state;
-  const std::string subject = "runtime/" + std::to_string(state.runtime_id.value());
+  AgentRuntimeId runtime_id{};
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    runtime_id = impl_->state.runtime_id;
+  }
+  const std::string subject = "runtime/" + std::to_string(runtime_id.value());
   if (impl_->options.scheduler_authority == nullptr) {
     return detail::reject(OutcomeCode::REJECT_INVALID, subject,
                           "no scheduler authority provider is configured");
   }
+  // The provider is an external callback: it is consulted with no canonical
+  // lock held, so it may itself query this runtime.
   std::optional<SchedulerAuthority> fresh =
-      impl_->options.scheduler_authority->current_assignment(state.runtime_id);
+      impl_->options.scheduler_authority->current_assignment(runtime_id);
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  CanonicalState& state = impl_->state;
   if (!fresh.has_value()) {
     if (state.has_assignment) {
       state.current_assignment.current = false;
@@ -1225,9 +1310,14 @@ MutationResult AgentRuntime::bind_memory(MemoryBinding binding) {
       existing = binding;
       if (generation_moved) {
         // A moved memory generation invalidates affected pending actions.
+        // Work that is already in flight or completed keeps its attempt: the
+        // commit rejects a moved memory generation, and demoting it would let a
+        // second attempt start while the first may still take effect.
         for (ActionRecord& action : state.actions) {
           if (action.memory_binding_id == binding.binding_id &&
-              action.state != ActionState::COMMITTED && !is_terminal(action.state)) {
+              action.state != ActionState::COMMITTED && !is_terminal(action.state) &&
+              !is_in_flight(action.state) &&
+              action.state != ActionState::COMPLETED_UNVALIDATED) {
             impl_->set_action_state_locked(action, ActionState::REVALIDATION_REQUIRED);
           }
         }
@@ -1263,9 +1353,12 @@ MutationResult AgentRuntime::invalidate_memory(MemoryBindingId binding_id,
   if (!found) {
     return detail::reject(OutcomeCode::REJECT_INVALID, subject, "memory binding does not exist");
   }
+  // In-flight and completed work keeps its attempt (its commit rejects the
+  // stale binding); demoting it would let a second attempt start.
   for (ActionRecord& action : state.actions) {
     if (action.memory_binding_id == binding_id && !action.committed &&
-        !is_terminal(action.state)) {
+        !is_terminal(action.state) && !is_in_flight(action.state) &&
+        action.state != ActionState::COMPLETED_UNVALIDATED) {
       impl_->set_action_state_locked(action, ActionState::REVALIDATION_REQUIRED);
       ++affected;
     }
@@ -1286,6 +1379,14 @@ MutationResult AgentRuntime::fence_boot(RuntimeBootId runtime_boot_id, AgentBoot
   }
   if (detail::is_fenced(state, runtime_boot_id, agent_boot_id)) {
     return detail::no_change(subject, "boot is already fenced");
+  }
+  if (runtime_boot_id == state.runtime_boot_id) {
+    // A fenced current boot can never regain authority, which leaves the
+    // runtime unable to act and its durable state unloadable. The current
+    // incarnation is fenced by recovering under a newer boot.
+    return detail::reject(OutcomeCode::REJECT_CONFLICT, subject,
+                          "the current runtime boot cannot be fenced; recover under a newer "
+                          "boot instead");
   }
   detail::FencedBootRecord record;
   record.runtime_boot_id = runtime_boot_id;
@@ -1655,17 +1756,20 @@ MutationResult AgentRuntime::admit_action(ActionId action_id, ActionGeneration a
       action->state == ActionState::COMMITTED) {
     return detail::no_change(subject, "action is already admitted or beyond admission");
   }
-  if (action->state != ActionState::DECLARED && action->state != ActionState::RETRY_PENDING &&
-      action->state != ActionState::REVALIDATION_REQUIRED) {
-    return detail::reject(OutcomeCode::REJECT_CONFLICT, subject,
-                          std::string("action state ") + std::string(to_string(action->state)) +
-                              " does not admit admission");
-  }
+  // Runtime cancellation is reported before the action-state conflict: the
+  // cancellation itself moved the action to CANCELLED, so a caller racing it
+  // learns that the runtime was cancelled, not that the action conflicted.
   if (state.cancellation != CancellationState::NONE ||
       state.lifecycle == RuntimeLifecycle::CANCELLING ||
       state.lifecycle == RuntimeLifecycle::CANCELLED) {
     return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
                           "runtime cancellation is in progress");
+  }
+  if (action->state != ActionState::DECLARED && action->state != ActionState::RETRY_PENDING &&
+      action->state != ActionState::REVALIDATION_REQUIRED) {
+    return detail::reject(OutcomeCode::REJECT_CONFLICT, subject,
+                          std::string("action state ") + std::string(to_string(action->state)) +
+                              " does not admit admission");
   }
   if (!can_admit(state.lifecycle)) {
     return detail::reject(OutcomeCode::SHUTTING_DOWN, subject,

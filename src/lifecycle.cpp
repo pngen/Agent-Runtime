@@ -224,6 +224,8 @@ bool can_dispatch(RuntimeLifecycle lifecycle) noexcept {
     case RuntimeLifecycle::WAITING_TOOL:
     case RuntimeLifecycle::WAITING_EXTERNAL:
     case RuntimeLifecycle::CHECKPOINTING:
+    // A drain admits no new work, but already-authorized obligations finish.
+    case RuntimeLifecycle::DRAINING:
       return true;
     default:
       return false;

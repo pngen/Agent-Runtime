@@ -72,6 +72,10 @@ class ReferenceCoordinator {
   distributed::TcpListener listener_;
   std::shared_ptr<distributed::FrameSession> session_;
   bool handshake_done_ = false;
+  /// Registration of the connected agent worker; work is dispatched only while
+  /// it names the runtime's current incarnation.
+  distributed::RegisterRuntimeMessage registration_{};
+  bool registered_ = false;
 };
 
 }  // namespace agent_runtime::reference

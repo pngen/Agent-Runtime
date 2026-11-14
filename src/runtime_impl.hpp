@@ -77,6 +77,9 @@ namespace agent_runtime {
 /// library shares one definition while the public header stays opaque.
 struct AgentRuntime::Impl {
   mutable std::mutex mutex;
+  /// Serializes save() from encoding to the atomic rename, so that an older
+  /// encoded document can never replace a newer one.
+  std::mutex save_mutex;
   AgentRuntimeOptions options;
   ResourceLimits limits;
   std::shared_ptr<Clock> clock;
@@ -181,6 +184,26 @@ struct AgentRuntime::Impl {
   /// loss, recovery or cancellation.
   void classify_unresolved_locked(detail::ActionRecord& action, detail::AttemptRecord& attempt,
                                   std::string reason);
+
+  /// Holds an action whose side effect may have happened and cannot be safely
+  /// repeated: it stays ambiguous until it is reconciled externally.
+  void hold_ambiguous_locked(detail::ActionRecord& action, std::string reason);
+
+  /// Holds every unvalidated completion of an action whose side effect cannot
+  /// be safely repeated. The effect happened, but the completion can no longer
+  /// be committed under the authority that produced it.
+  void hold_unvalidated_completions_locked();
+
+  /// Supersedes the work a lost process left unresolved: in-flight attempts and
+  /// unvalidated completions. Actions that cannot be safely repeated are held
+  /// as ambiguous; the rest require revalidation.
+  void supersede_lost_work_locked(const std::string& reason);
+
+  /// Returns a waiting action to ADMITTED without admit_action(). An ambiguous
+  /// action stays held, a lifecycle that does not admit work gains no admitted
+  /// action (when required), and the active-action bound still applies.
+  /// Returns whether the action was revived.
+  bool revive_for_admission_locked(detail::ActionRecord& action, bool require_admitting_lifecycle);
 
   /// Classifies an unprovable completion according to the side-effect class:
   /// reconciliation is required for classes that cannot be safely repeated, and

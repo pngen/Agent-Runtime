@@ -14,7 +14,96 @@ namespace agent_runtime {
 
 using detail::CanonicalState;
 
+namespace {
+
+/// Prepares a decoded durable state for installation in a new process. Every
+/// identity it holds is reserved, dynamic authority is marked stale, and a
+/// non-terminal runtime must recover before it may act again. A terminal
+/// runtime (cancelled, completed, failed, retired) stays terminal.
+void prepare_restored_state(CanonicalState& restored, const char* recovery_reason) {
+  std::uint64_t highest_id = 0;
+  auto observe = [&highest_id](std::uint64_t value) {
+    if (value > highest_id) {
+      highest_id = value;
+    }
+  };
+  observe(restored.runtime_id.value());
+  observe(restored.agent_id.value());
+  observe(restored.run_id.value());
+  observe(restored.step_id.value());
+  for (const detail::RunRecord& run : restored.runs) {
+    observe(run.id.value());
+  }
+  for (const detail::StepRecord& step : restored.steps) {
+    observe(step.id.value());
+  }
+  for (const detail::ActionRecord& action : restored.actions) {
+    observe(action.id.value());
+    observe(action.memory_binding_id.value());
+    observe(action.checkpoint_binding_id.value());
+    observe(action.budget_id.value());
+    observe(action.policy_id.value());
+    for (const ActionId dependency : action.dependencies) {
+      observe(dependency.value());
+    }
+  }
+  for (const detail::AttemptRecord& attempt : restored.attempts) {
+    observe(attempt.id.value());
+    observe(attempt.result_id.value());
+    observe(attempt.model_call_id.value());
+    observe(attempt.tool_call_id.value());
+  }
+  for (const MemoryBinding& binding : restored.memory_bindings) {
+    observe(binding.binding_id.value());
+  }
+  for (const detail::CheckpointRecord& checkpoint : restored.checkpoints) {
+    observe(checkpoint.binding.binding_id.value());
+  }
+  for (const detail::AssignmentRecord& assignment : restored.assignments) {
+    observe(assignment.authority.assignment_id.value());
+  }
+  observe(restored.budget.budget_id.value());
+  IdAllocator::observe(highest_id);
+
+  if (!is_terminal(restored.lifecycle)) {
+    restored.lifecycle = RuntimeLifecycle::RECOVERING;
+    restored.recovery = RecoveryStatus::DURABLE_STATE_RESTORED;
+    restored.recovery_reason = recovery_reason;
+  }
+  restored.has_assignment = false;
+  restored.current_assignment.current = false;
+  restored.has_budget = false;
+  for (detail::AssignmentRecord& assignment : restored.assignments) {
+    assignment.current = false;
+  }
+  for (ModelBinding& binding : restored.model_bindings) {
+    binding.current = false;
+  }
+  for (ToolBinding& binding : restored.tool_bindings) {
+    binding.current = false;
+  }
+  for (MemoryBinding& binding : restored.memory_bindings) {
+    binding.fresh = false;
+  }
+  for (detail::CheckpointRecord& checkpoint : restored.checkpoints) {
+    if (checkpoint.state == CheckpointState::ACCEPTED ||
+        checkpoint.state == CheckpointState::REQUESTED ||
+        checkpoint.state == CheckpointState::IN_PROGRESS) {
+      checkpoint.state = CheckpointState::REVALIDATION_REQUIRED;
+      checkpoint.binding.current = false;
+    }
+  }
+}
+
+constexpr const char* kLostAttemptReason =
+    "process authority was lost while the attempt was in flight";
+
+}  // namespace
+
 MutationResult AgentRuntime::save(const std::string& path) const {
+  // Saves are serialized from encoding to the rename: a document encoded
+  // earlier must never replace one encoded and written later.
+  std::lock_guard<std::mutex> save_guard(impl_->save_mutex);
   std::unique_lock<std::mutex> lock(impl_->mutex);
   const std::string subject = "runtime/" + std::to_string(impl_->state.runtime_id.value());
 
@@ -86,6 +175,12 @@ MutationResult AgentRuntime::load(const std::string& path) {
   if (!read_ok) {
     return detail::reject(OutcomeCode::REJECT_INVALID, subject, "durable load failed: " + error);
   }
+  // The file was read with no lock held; another thread may have initialized
+  // or loaded this runtime meanwhile.
+  if (impl_->state.lifecycle != RuntimeLifecycle::DECLARED) {
+    return detail::reject(OutcomeCode::REJECT_CONFLICT, subject,
+                          "the runtime left the declared state while the document was read");
+  }
 
   detail::DecodeResult decoded = detail::decode_document(
       std::span<const std::uint8_t>(bytes.data(), bytes.size()), limits);
@@ -100,99 +195,17 @@ MutationResult AgentRuntime::load(const std::string& path) {
   }
 
   // The candidate has already passed structural and semantic validation. Apply
-  // it, then immediately mark every dynamic binding as requiring revalidation.
+  // it, then immediately mark every dynamic binding as requiring revalidation
+  // and supersede the work the previous process left unresolved.
   CanonicalState restored = std::move(*decoded.state);
-  std::uint64_t highest_id = 0;
-  auto observe = [&highest_id](std::uint64_t value) {
-    if (value > highest_id) {
-      highest_id = value;
-    }
-  };
-  observe(restored.runtime_id.value());
-  observe(restored.agent_id.value());
-  observe(restored.run_id.value());
-  observe(restored.step_id.value());
-  for (const detail::RunRecord& run : restored.runs) {
-    observe(run.id.value());
-  }
-  for (const detail::StepRecord& step : restored.steps) {
-    observe(step.id.value());
-  }
-  for (const detail::ActionRecord& action : restored.actions) {
-    observe(action.id.value());
-    observe(action.memory_binding_id.value());
-    observe(action.checkpoint_binding_id.value());
-    observe(action.budget_id.value());
-    observe(action.policy_id.value());
-    for (const ActionId dependency : action.dependencies) {
-      observe(dependency.value());
-    }
-  }
-  for (const detail::AttemptRecord& attempt : restored.attempts) {
-    observe(attempt.id.value());
-    observe(attempt.result_id.value());
-    observe(attempt.model_call_id.value());
-    observe(attempt.tool_call_id.value());
-  }
-  for (const MemoryBinding& binding : restored.memory_bindings) {
-    observe(binding.binding_id.value());
-  }
-  for (const detail::CheckpointRecord& checkpoint : restored.checkpoints) {
-    observe(checkpoint.binding.binding_id.value());
-  }
-  for (const detail::AssignmentRecord& assignment : restored.assignments) {
-    observe(assignment.authority.assignment_id.value());
-  }
-  observe(restored.budget.budget_id.value());
-  IdAllocator::observe(highest_id);
-
-  restored.lifecycle = RuntimeLifecycle::RECOVERING;
-  restored.recovery = RecoveryStatus::DURABLE_STATE_RESTORED;
-  restored.recovery_reason = "durable state loaded; dynamic authority is not current";
-  restored.has_assignment = false;
-  restored.current_assignment.current = false;
-  restored.has_budget = false;
-  for (detail::AssignmentRecord& assignment : restored.assignments) {
-    assignment.current = false;
-  }
-  for (ModelBinding& binding : restored.model_bindings) {
-    binding.current = false;
-  }
-  for (ToolBinding& binding : restored.tool_bindings) {
-    binding.current = false;
-  }
-  for (MemoryBinding& binding : restored.memory_bindings) {
-    binding.fresh = false;
-  }
-  for (detail::CheckpointRecord& checkpoint : restored.checkpoints) {
-    if (checkpoint.state == CheckpointState::ACCEPTED ||
-        checkpoint.state == CheckpointState::REQUESTED ||
-        checkpoint.state == CheckpointState::IN_PROGRESS) {
-      checkpoint.state = CheckpointState::REVALIDATION_REQUIRED;
-      checkpoint.binding.current = false;
-    }
-  }
-  for (detail::AttemptRecord& attempt : restored.attempts) {
-    if (is_in_flight(attempt.state)) {
-      attempt.superseded = true;
-      attempt.current = false;
-      attempt.state = ActionState::REVALIDATION_REQUIRED;
-      attempt.error = "process authority was lost while the attempt was in flight";
-    }
-  }
-  for (detail::ActionRecord& action : restored.actions) {
-    if (is_in_flight(action.state) || action.state == ActionState::COMPLETED_UNVALIDATED) {
-      action.state = ActionState::REVALIDATION_REQUIRED;
-      action.current_attempt = ActionAttemptId{};
-      action.current_attempt_generation = AttemptGeneration{};
-    }
-  }
+  prepare_restored_state(restored, "durable state loaded; dynamic authority is not current");
   restored.mutation_sequence += 1;
 
   impl_->state = std::move(restored);
   impl_->backends.clear();
   impl_->inflight_cancellation = std::make_shared<std::atomic<bool>>(false);
   impl_->reindex();
+  impl_->supersede_lost_work_locked(kLostAttemptReason);
 
   detail::record_provenance(impl_->state, *impl_->clock, "load", path);
   return impl_->finish_locked(detail::accepted(
@@ -239,41 +252,13 @@ std::unique_ptr<AgentRuntime> AgentRuntime::open_durable_state(const std::string
   auto runtime = std::make_unique<AgentRuntime>(std::move(options));
 
   CanonicalState restored = std::move(*decoded.state);
-  restored.lifecycle = RuntimeLifecycle::RECOVERING;
-  restored.recovery = RecoveryStatus::DURABLE_STATE_RESTORED;
-  restored.recovery_reason = "opened for inspection; dynamic authority is not current";
-  restored.has_assignment = false;
-  restored.current_assignment.current = false;
-  restored.has_budget = false;
-  for (detail::AssignmentRecord& assignment : restored.assignments) {
-    assignment.current = false;
+  prepare_restored_state(restored, "opened for inspection; dynamic authority is not current");
+  {
+    std::lock_guard<std::mutex> lock(runtime->impl_->mutex);
+    runtime->impl_->state = std::move(restored);
+    runtime->impl_->reindex();
+    runtime->impl_->supersede_lost_work_locked(kLostAttemptReason);
   }
-  for (ModelBinding& binding : restored.model_bindings) {
-    binding.current = false;
-  }
-  for (ToolBinding& binding : restored.tool_bindings) {
-    binding.current = false;
-  }
-  for (MemoryBinding& binding : restored.memory_bindings) {
-    binding.fresh = false;
-  }
-  for (detail::AttemptRecord& attempt : restored.attempts) {
-    if (is_in_flight(attempt.state)) {
-      attempt.superseded = true;
-      attempt.current = false;
-      attempt.state = ActionState::REVALIDATION_REQUIRED;
-      attempt.error = "process authority was lost while the attempt was in flight";
-    }
-  }
-  for (detail::ActionRecord& action : restored.actions) {
-    if (is_in_flight(action.state) || action.state == ActionState::COMPLETED_UNVALIDATED) {
-      action.state = ActionState::REVALIDATION_REQUIRED;
-      action.current_attempt = ActionAttemptId{};
-      action.current_attempt_generation = AttemptGeneration{};
-    }
-  }
-  runtime->impl_->state = std::move(restored);
-  runtime->impl_->reindex();
   result = detail::accepted("persistence/" + path, "durable state opened for inspection",
                             {ExplanationFactor{"record_count",
                                                std::to_string(decoded.info.record_count)}});

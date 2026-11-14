@@ -23,6 +23,7 @@ agent_runtime_add_test(ar_test_property test_property.cpp)
 agent_runtime_add_test(ar_test_adversarial test_adversarial.cpp)
 agent_runtime_add_test(ar_test_races test_races.cpp)
 agent_runtime_add_test(ar_test_shutdown test_shutdown.cpp)
+agent_runtime_add_test(ar_test_regression test_regression.cpp)
 
 if(TARGET agent_runtime_reference)
   agent_runtime_add_test(ar_test_protocol test_protocol.cpp)

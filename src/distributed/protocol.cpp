@@ -14,6 +14,11 @@
 namespace agent_runtime::distributed {
 namespace {
 
+/// Identifiers (tool names, model targets, operation keys) are written whole:
+/// a receiver refuses one longer than its bound instead of acting on a
+/// truncated name or deduplicating on a truncated operation key.
+constexpr std::uint32_t kWholeIdentifier = 0xFFFFFFFFu;
+
 constexpr std::size_t kMagicOffset = 0;
 constexpr std::size_t kVersionOffset = 4;
 constexpr std::size_t kTypeOffset = 6;
@@ -437,9 +442,9 @@ std::vector<std::uint8_t> encode_tool_request(const ToolRequest& request) {
   writer.u64(request.attempt_generation.value());
   writer.u64(request.runtime_id.value());
   writer.u64(request.runtime_boot_id.value());
-  writer.text(request.tool_name);
+  writer.text(request.tool_name, kWholeIdentifier);
   writer.u16(static_cast<std::uint16_t>(request.side_effect));
-  writer.text(request.operation_key);
+  writer.text(request.operation_key, kWholeIdentifier);
   writer.text(request.input, 1024 * 1024);
   writer.u64(request.input_digest);
   writer.u32(request.max_output_bytes);
@@ -542,7 +547,7 @@ std::vector<std::uint8_t> encode_model_request(const ModelRequest& request) {
   writer.u64(request.attempt_generation.value());
   writer.u64(request.runtime_id.value());
   writer.u64(request.runtime_boot_id.value());
-  writer.text(request.target);
+  writer.text(request.target, kWholeIdentifier);
   writer.text(request.prompt, 1024 * 1024);
   writer.u32(request.max_output_bytes);
   writer.u64(request.request_digest);

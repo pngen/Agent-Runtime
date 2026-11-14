@@ -90,7 +90,12 @@ bool ReferenceCoordinator::await_registration(distributed::RegisterRuntimeMessag
     error = "expected REGISTER_RUNTIME from agent worker";
     return false;
   }
-  return distributed::decode_register_runtime(frame.payload, registration, error);
+  if (!distributed::decode_register_runtime(frame.payload, registration, error)) {
+    return false;
+  }
+  registration_ = registration;
+  registered_ = true;
+  return true;
 }
 
 void ReferenceCoordinator::drop_agent() noexcept {
@@ -99,6 +104,8 @@ void ReferenceCoordinator::drop_agent() noexcept {
     session_.reset();
   }
   handshake_done_ = false;
+  registered_ = false;
+  registration_ = distributed::RegisterRuntimeMessage{};
 }
 
 bool ReferenceCoordinator::send_to_agent(const distributed::Frame& frame, std::string& error) {
@@ -127,6 +134,17 @@ bool ReferenceCoordinator::try_receive_from_agent(distributed::Frame& frame) {
 
 bool ReferenceCoordinator::dispatch_tool_action(const ActionSpec& spec, ActionHandle& out,
                                                 DispatchResult& dispatched, std::string& error) {
+  // The agent worker executes the request. A worker that registered a
+  // superseded (fenced) incarnation must never receive work.
+  if (session_ == nullptr || !registered_) {
+    error = "no registered agent worker is connected";
+    return false;
+  }
+  if (registration_.runtime_boot_id != runtime_->boot_id() ||
+      registration_.agent_boot_id != runtime_->summary().agent_boot_id) {
+    error = "the connected agent worker registered a superseded runtime incarnation";
+    return false;
+  }
   const MutationResult declared = runtime_->declare_action(spec, out);
   if (!declared.accepted()) {
     error = "declare_action: " + declared.to_text();

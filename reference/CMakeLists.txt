@@ -21,9 +21,11 @@ if(WIN32)
 endif()
 
 # The reference workers are emitted into this directory. Recording it lets the
-# launcher find them from any test or consumer binary location.
+# launcher find them from any test or consumer binary location. The directory is
+# taken from the worker target itself so that multi-config generators (the default
+# Visual Studio generator) record the per-configuration subdirectory.
 target_compile_definitions(agent_runtime_reference PRIVATE
-  AGENT_RUNTIME_REFERENCE_TOOLS_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+  AGENT_RUNTIME_REFERENCE_TOOLS_DIR="$<TARGET_FILE_DIR:agent_runtime_tool_worker>")
 
 add_executable(agent_runtime_tool_worker tool_worker_main.cpp)
 target_link_libraries(agent_runtime_tool_worker PRIVATE agent_runtime agent_runtime_reference)

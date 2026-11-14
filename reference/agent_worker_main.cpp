@@ -206,11 +206,21 @@ struct Options {
     return response;
   }
   Frame reply;
-  if (!session.receive(reply) || reply.type != MessageType::MODEL_RESULT) {
+  if (!session.receive(reply)) {
+    session.stop();
+    // The request was delivered: the model worker may have acted on it before
+    // it disappeared, so the outcome is ambiguous, not a definite failure. The
+    // runtime retries it only when the action's side-effect class allows.
+    response.status = CompletionStatus::AMBIGUOUS;
+    response.failure_class = RetryClass::AMBIGUOUS_COMPLETION;
+    response.error = "model worker disappeared before reporting the result";
+    return response;
+  }
+  if (reply.type != MessageType::MODEL_RESULT) {
     session.stop();
     response.status = CompletionStatus::FAILED;
     response.failure_class = RetryClass::MODEL_UNAVAILABLE;
-    response.error = "model worker disappeared before reporting the result";
+    response.error = "unexpected reply type from model worker";
     return response;
   }
   session.stop();
@@ -322,6 +332,32 @@ int main(int argc, char** argv) {
     if (frame.type == MessageType::TOOL_REQUEST) {
       ToolRequest request;
       if (!decode_tool_request(frame.payload, request, error)) {
+        // A request that cannot be decoded is refused explicitly, never
+        // dropped: the coordinator is waiting for an answer.
+        Frame refusal;
+        refusal.type = MessageType::ERROR_MESSAGE;
+        refusal.correlation = frame.correlation;
+        ErrorMessage message;
+        message.code = 3;
+        message.detail = "tool request refused: " + error;
+        refusal.payload = encode_error(message);
+        if (!session.send(refusal, error)) {
+          break;
+        }
+        continue;
+      }
+      if (request.runtime_boot_id != RuntimeBootId(options.runtime_boot)) {
+        // This worker serves only the incarnation it registered: work stamped
+        // for another runtime boot is refused without being executed.
+        Frame refusal;
+        refusal.type = MessageType::TOOL_RESULT;
+        refusal.correlation = frame.correlation;
+        refusal.payload = encode_tool_response(
+            failure_response(request, CompletionStatus::FAILED, RetryClass::STALE_AUTHORITY,
+                             "agent worker serves a different runtime incarnation"));
+        if (!session.send(refusal, error)) {
+          break;
+        }
         continue;
       }
       const Endpoint& endpoint =
@@ -343,6 +379,35 @@ int main(int argc, char** argv) {
     if (frame.type == MessageType::MODEL_REQUEST) {
       ModelRequest request;
       if (!decode_model_request(frame.payload, request, error)) {
+        Frame refusal;
+        refusal.type = MessageType::ERROR_MESSAGE;
+        refusal.correlation = frame.correlation;
+        ErrorMessage message;
+        message.code = 3;
+        message.detail = "model request refused: " + error;
+        refusal.payload = encode_error(message);
+        if (!session.send(refusal, error)) {
+          break;
+        }
+        continue;
+      }
+      if (request.runtime_boot_id != RuntimeBootId(options.runtime_boot)) {
+        ModelResponse refused;
+        refused.action_id = request.action_id;
+        refused.call_id = request.call_id;
+        refused.call_generation = request.call_generation;
+        refused.attempt_id = request.attempt_id;
+        refused.attempt_generation = request.attempt_generation;
+        refused.status = CompletionStatus::FAILED;
+        refused.failure_class = RetryClass::STALE_AUTHORITY;
+        refused.error = "agent worker serves a different runtime incarnation";
+        Frame refusal;
+        refusal.type = MessageType::MODEL_RESULT;
+        refusal.correlation = frame.correlation;
+        refusal.payload = encode_model_response(refused);
+        if (!session.send(refusal, error)) {
+          break;
+        }
         continue;
       }
       ModelResponse response = forward_model(options.model, request);

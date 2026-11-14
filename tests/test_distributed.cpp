@@ -501,6 +501,13 @@ AR_TEST(distributed, coordinator_restart_preserves_progress_and_fences_old_epoch
   const PersistenceProbe probe = persistence_inspect(state_path);
   AR_REQUIRE_MSG(probe.valid(), probe.explanation.to_text());
   AR_CHECK(probe.document_json.find("\"fenced_boots\"") != std::string::npos);
+  MutationResult opened;
+  const std::unique_ptr<AgentRuntime> durable = AgentRuntime::open_durable_state(state_path, opened);
+  AR_REQUIRE_MSG(durable != nullptr, opened.to_text());
+  const RuntimeSummary durable_summary = durable->summary();
+  AR_CHECK_EQ(durable_summary.committed_actions, 2u);
+  AR_CHECK_EQ(durable_summary.runtime_boot_id.value(), 2ull);
+  AR_CHECK_EQ(durable_summary.fenced_boots, 1u);
 
   std::string ignored;
   (void)agent_prime.kill(ignored);
@@ -508,4 +515,159 @@ AR_TEST(distributed, coordinator_restart_preserves_progress_and_fences_old_epoch
   std::filesystem::remove_all(workers.tool_scratch, remove_error);
   std::filesystem::remove_all(workers.crash_scratch, remove_error);
   std::filesystem::remove(state_path, remove_error);
+}
+
+namespace {
+
+[[nodiscard]] bool start_registered_coordinator(ReferenceCoordinator& coordinator,
+                                                const WorkerSet& workers, ChildProcess& agent,
+                                                std::string& error) {
+  if (!coordinator.start(error) ||
+      !start_agent_worker(agent, workers, coordinator.port(), 1, 1, 1, 1, error) ||
+      !coordinator.accept_agent(error)) {
+    return false;
+  }
+  distributed::RegisterRuntimeMessage registration;
+  return coordinator.await_registration(registration, error);
+}
+
+[[nodiscard]] CoordinatorOptions boot_one_options() {
+  CoordinatorOptions options;
+  options.runtime.runtime_id = AgentRuntimeId(9001);
+  options.runtime.agent_id = AgentId(7001);
+  options.runtime.runtime_boot_id = RuntimeBootId(1);
+  options.runtime.agent_boot_id = AgentBootId(1);
+  options.runtime.runtime_epoch = RuntimeEpoch(1);
+  options.runtime.coordinator_epoch = CoordinatorEpoch(1);
+  options.runtime.clock = std::make_shared<SystemClock>();
+  options.runtime.policy = RuntimePolicy::permissive();
+  options.runtime.policy.require_assignment_for_dispatch = true;
+  return options;
+}
+
+}  // namespace
+
+AR_TEST(distributed, coordinator_refuses_to_dispatch_to_a_superseded_incarnation) {
+  WorkerSet workers;
+  std::string error;
+  AR_REQUIRE_MSG(start_workers(workers, "superseded", 1, false, error), error);
+  ReferenceCoordinator coordinator(boot_one_options());
+  ChildProcess agent;
+  AR_REQUIRE_MSG(start_registered_coordinator(coordinator, workers, agent, error), error);
+
+  AgentRuntime& runtime = coordinator.runtime();
+  AR_REQUIRE(runtime.initialize().accepted());
+  AR_REQUIRE(runtime.bind_assignment(assignment_for(7001, 1)).accepted());
+  AR_REQUIRE_MSG(register_remote_bindings(coordinator, workers, error), error);
+  AR_REQUIRE(runtime.start_run(AgentRunId(101), AgentRunGeneration(1)).accepted());
+  AR_REQUIRE(runtime.begin_step().accepted());
+
+  // The runtime moves to a new incarnation while the session of the old agent
+  // worker (registered as boots 1/1) is still open.
+  RecoveryContext recovery;
+  recovery.runtime_boot_id = RuntimeBootId(2);
+  recovery.agent_boot_id = AgentBootId(2);
+  recovery.runtime_epoch = RuntimeEpoch(2);
+  recovery.coordinator_epoch = CoordinatorEpoch(2);
+  AR_REQUIRE(runtime.recover(recovery).accepted());
+  AR_REQUIRE_MSG(register_remote_bindings(coordinator, workers, error), error);
+  ResumeContext resume;
+  resume.runtime_boot_id = RuntimeBootId(2);
+  resume.agent_boot_id = AgentBootId(2);
+  resume.runtime_epoch = RuntimeEpoch(2);
+  resume.coordinator_epoch = CoordinatorEpoch(2);
+  resume.assignment = assignment_for(7001, 2);
+  const MutationResult resumed = runtime.resume(resume);
+  AR_REQUIRE_MSG(resumed.accepted(), resumed.to_text());
+
+  ActionHandle handle;
+  DispatchResult dispatched;
+  const bool sent = coordinator.dispatch_tool_action(
+      tool_spec("non-repeatable", SideEffectClass::NON_REPEATABLE, "charge", "op-superseded"),
+      handle, dispatched, error);
+  AR_CHECK_MSG(!sent, "the fenced incarnation's agent worker must not receive new work");
+  AR_CHECK_EQ(runtime.summary().total_attempts, 0u);
+
+  std::string ignored;
+  (void)agent.kill(ignored);
+  std::error_code remove_error;
+  std::filesystem::remove_all(workers.tool_scratch, remove_error);
+  std::filesystem::remove_all(workers.crash_scratch, remove_error);
+}
+
+AR_TEST(distributed, agent_worker_refuses_work_for_another_runtime_incarnation) {
+  WorkerSet workers;
+  std::string error;
+  AR_REQUIRE_MSG(start_workers(workers, "other_incarnation", 1, false, error), error);
+  ReferenceCoordinator coordinator(boot_one_options());
+  ChildProcess agent;
+  AR_REQUIRE_MSG(start_registered_coordinator(coordinator, workers, agent, error), error);
+
+  ToolRequest request;
+  request.call_id = ToolCallId(77);
+  request.call_generation = ToolCallGeneration(1);
+  request.action_id = ActionId(78);
+  request.action_generation = ActionGeneration(1);
+  request.attempt_id = ActionAttemptId(79);
+  request.attempt_generation = AttemptGeneration(1);
+  request.runtime_id = AgentRuntimeId(9001);
+  request.runtime_boot_id = RuntimeBootId(2);  // not the incarnation this worker registered
+  request.tool_name = "hash";
+  request.side_effect = SideEffectClass::PURE;
+  request.input = "x";
+  request.max_output_bytes = 4096;
+  distributed::Frame frame;
+  frame.type = distributed::MessageType::TOOL_REQUEST;
+  frame.correlation = CorrelationId(79);
+  frame.payload = distributed::encode_tool_request(request);
+  AR_REQUIRE_MSG(coordinator.send_to_agent(frame, error), error);
+  DispatchResult reserved;
+  reserved.attempt_id = request.attempt_id;
+  ToolResponse response;
+  AR_REQUIRE_MSG(coordinator.await_tool_result(reserved, response, error), error);
+  AR_CHECK_EQ(std::string(to_string(response.status)), std::string("FAILED"));
+  AR_CHECK_EQ(std::string(to_string(response.failure_class)), std::string("STALE_AUTHORITY"));
+
+  std::string ignored;
+  (void)agent.kill(ignored);
+  std::error_code remove_error;
+  std::filesystem::remove_all(workers.tool_scratch, remove_error);
+  std::filesystem::remove_all(workers.crash_scratch, remove_error);
+}
+
+AR_TEST(distributed, loopback_listener_port_cannot_be_bound_twice) {
+  distributed::SocketSystem::ensure();
+  distributed::TcpListener first;
+  std::string error;
+  AR_REQUIRE_MSG(first.listen_loopback(0, error), error);
+  distributed::TcpListener second;
+  std::string second_error;
+  AR_CHECK_MSG(!second.listen_loopback(first.port(), second_error),
+               "a second listener must not share a port that is already listening");
+  second.close();
+  first.close();
+}
+
+AR_TEST(distributed, oversized_identifiers_are_refused_not_truncated) {
+  ToolRequest request;
+  request.call_id = ToolCallId(1);
+  request.call_generation = ToolCallGeneration(1);
+  request.action_id = ActionId(2);
+  request.action_generation = ActionGeneration(1);
+  request.attempt_id = ActionAttemptId(3);
+  request.attempt_generation = AttemptGeneration(1);
+  request.runtime_id = AgentRuntimeId(9001);
+  request.runtime_boot_id = RuntimeBootId(1);
+  request.tool_name = "non-repeatable";
+  request.side_effect = SideEffectClass::NON_REPEATABLE;
+  // Two keys sharing their first 4096 bytes name two different operations.
+  request.operation_key = std::string(4096, 'k') + "-second-operation";
+  request.input = "x";
+  ToolRequest decoded;
+  std::string error;
+  const bool accepted =
+      distributed::decode_tool_request(distributed::encode_tool_request(request), decoded, error);
+  AR_CHECK_MSG(!accepted || decoded.operation_key == request.operation_key,
+               "an operation key must never arrive truncated");
+  AR_CHECK_MSG(!accepted, "an operation key beyond the wire bound must be refused");
 }

@@ -579,8 +579,8 @@ MutationResult AgentRuntime::submit_model_completion(const ModelResponse& respon
     attempt.current = false;
     impl_->set_attempt_state_locked(attempt, ActionState::CANCELLED);
     attempt.error = "late model completion rejected by cancellation";
-    return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
-                          "late model completion rejected by cancellation");
+    return impl_->finish_locked(detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
+                                               "late model completion rejected by cancellation"));
   }
   if (state.lifecycle == RuntimeLifecycle::COMPLETED ||
       state.lifecycle == RuntimeLifecycle::RETIRED) {
@@ -602,7 +602,8 @@ MutationResult AgentRuntime::submit_model_completion(const ModelResponse& respon
     attempt.current = false;
     impl_->set_attempt_state_locked(attempt, ActionState::REVALIDATION_REQUIRED);
     attempt.error = "model backend incarnation changed before completion was observed";
-    return detail::reject(OutcomeCode::REJECT_STALE_MODEL_BINDING, subject, attempt.error);
+    return impl_->finish_locked(
+        detail::reject(OutcomeCode::REJECT_STALE_MODEL_BINDING, subject, attempt.error));
   }
   if (response.backend_generation.valid() &&
       response.backend_generation != attempt.backend_generation) {
@@ -647,8 +648,8 @@ MutationResult AgentRuntime::submit_model_completion(const ModelResponse& respon
     impl_->set_action_state_locked(action, ActionState::CANCELLED);
     action.current_attempt = ActionAttemptId{};
     action.current_attempt_generation = AttemptGeneration{};
-    return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
-                          "model backend reports the call was cancelled");
+    return impl_->finish_locked(detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
+                                               "model backend reports the call was cancelled"));
   }
   return impl_->finish_locked(impl_->mark_retry_pending_locked(
       action, attempt, response.failure_class == RetryClass::NONE ? RetryClass::UNKNOWN
@@ -737,12 +738,13 @@ MutationResult AgentRuntime::submit_tool_completion(const ToolResponse& response
       action.last_error = attempt.error;
       action.current_attempt = ActionAttemptId{};
       action.current_attempt_generation = AttemptGeneration{};
-      return detail::reject(OutcomeCode::AMBIGUOUS_COMPLETION, subject,
-                            "tool completion arrived after cancellation and the side-effect class "
-                            "cannot be reconciled automatically");
+      return impl_->finish_locked(detail::reject(
+          OutcomeCode::AMBIGUOUS_COMPLETION, subject,
+          "tool completion arrived after cancellation and the side-effect class "
+          "cannot be reconciled automatically"));
     }
-    return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
-                          "late tool completion rejected by cancellation");
+    return impl_->finish_locked(detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
+                                               "late tool completion rejected by cancellation"));
   }
   if (state.lifecycle == RuntimeLifecycle::COMPLETED ||
       state.lifecycle == RuntimeLifecycle::RETIRED) {
@@ -773,9 +775,11 @@ MutationResult AgentRuntime::submit_tool_completion(const ToolResponse& response
       action.last_error = attempt.error;
       action.current_attempt = ActionAttemptId{};
       action.current_attempt_generation = AttemptGeneration{};
-      return detail::reject(OutcomeCode::AMBIGUOUS_COMPLETION, subject, attempt.error);
+      return impl_->finish_locked(
+          detail::reject(OutcomeCode::AMBIGUOUS_COMPLETION, subject, attempt.error));
     }
-    return detail::reject(OutcomeCode::REJECT_STALE_TOOL_BINDING, subject, attempt.error);
+    return impl_->finish_locked(
+        detail::reject(OutcomeCode::REJECT_STALE_TOOL_BINDING, subject, attempt.error));
   }
   if (response.backend_generation.valid() &&
       response.backend_generation != attempt.backend_generation) {
@@ -826,8 +830,8 @@ MutationResult AgentRuntime::submit_tool_completion(const ToolResponse& response
     impl_->set_action_state_locked(action, ActionState::CANCELLED);
     action.current_attempt = ActionAttemptId{};
     action.current_attempt_generation = AttemptGeneration{};
-    return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
-                          "tool backend reports the call was cancelled");
+    return impl_->finish_locked(detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
+                                               "tool backend reports the call was cancelled"));
   }
   return impl_->finish_locked(impl_->mark_retry_pending_locked(
       action, attempt,
@@ -923,8 +927,8 @@ MutationResult AgentRuntime::commit_action(ActionId action_id, ActionGeneration 
     impl_->set_action_state_locked(*action, ActionState::CANCELLED);
     action->current_attempt = ActionAttemptId{};
     action->current_attempt_generation = AttemptGeneration{};
-    return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
-                          "cancelled runtime must not commit progress");
+    return impl_->finish_locked(detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
+                                               "cancelled runtime must not commit progress"));
   }
   if (state.lifecycle == RuntimeLifecycle::COMPLETED ||
       state.lifecycle == RuntimeLifecycle::RETIRED) {

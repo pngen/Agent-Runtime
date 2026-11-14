@@ -234,8 +234,17 @@ bool TcpListener::listen_loopback(std::uint16_t port, std::string& error) {
     error = "listener socket creation failed";
     return false;
   }
-  const char reuse = 1;
+#ifdef _WIN32
+  // On Windows SO_REUSEADDR lets a second socket bind a port that is still
+  // listening, so a stale and a restarted coordinator could both accept on it.
+  // Exclusive use makes the second bind fail instead.
+  const BOOL exclusive = TRUE;
+  ::setsockopt(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive),
+               sizeof(exclusive));
+#else
+  const int reuse = 1;
   ::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = ::htonl(0x7F000001u);  // 127.0.0.1 only
@@ -344,7 +353,13 @@ void FrameSession::reader_main() {
     }
     condition_.notify_all();
   }
-  open_.store(false, std::memory_order_release);
+  {
+    // The closed flag is published under the queue mutex: receive() evaluates
+    // it under that mutex, so the wakeup cannot fall between its check and its
+    // wait.
+    std::lock_guard<std::mutex> lock(mutex_);
+    open_.store(false, std::memory_order_release);
+  }
   condition_.notify_all();
 }
 
@@ -352,6 +367,9 @@ void FrameSession::stop() noexcept {
   stopping_.store(true, std::memory_order_release);
   if (connection_ != nullptr) {
     connection_->close();
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
   }
   condition_.notify_all();
   if (reader_.joinable()) {
@@ -362,7 +380,11 @@ void FrameSession::stop() noexcept {
       reader_.join();
     }
   }
-  open_.store(false, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    open_.store(false, std::memory_order_release);
+  }
+  condition_.notify_all();
 }
 
 bool FrameSession::send(const Frame& frame, std::string& error) {

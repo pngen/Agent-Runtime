@@ -328,6 +328,15 @@ int run_phase_two(const Options& options) {
     std::fprintf(stderr, "coordinator: recover failed: %s\n", recovered.to_text().c_str());
     return 5;
   }
+  // The new incarnation and the fencing of the previous one are durable before
+  // any agent worker is served: a later restart must not hand the same boot to
+  // another process or forget the fence.
+  const MutationResult recovery_saved = runtime.save(options.state_path);
+  if (!recovery_saved.accepted()) {
+    std::fprintf(stderr, "coordinator: save after recovery failed: %s\n",
+                 recovery_saved.to_text().c_str());
+    return 14;
+  }
 
   if (!coordinator.accept_agent(error)) {
     std::fprintf(stderr, "coordinator: %s\n", error.c_str());
@@ -376,6 +385,11 @@ int run_phase_two(const Options& options) {
   if (!committed.accepted()) {
     std::fprintf(stderr, "coordinator: commit failed: %s\n", committed.to_text().c_str());
     return 13;
+  }
+  const MutationResult progress_saved = runtime.save(options.state_path);
+  if (!progress_saved.accepted()) {
+    std::fprintf(stderr, "coordinator: save failed: %s\n", progress_saved.to_text().c_str());
+    return 15;
   }
   const RuntimeSummary summary = runtime.summary();
   std::printf("PHASE2 committed=%u progress=%llu fenced=%u lifecycle=%s\n",

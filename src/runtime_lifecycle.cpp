@@ -5,8 +5,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "runtime_impl.hpp"
 
@@ -214,7 +216,7 @@ MutationResult AgentRuntime::accept_checkpoint(const CheckpointBinding& binding)
       action.checkpoint_binding_id = record->binding.binding_id;
       action.checkpoint_generation = record->binding.generation;
       if (action.state == ActionState::REVALIDATION_REQUIRED) {
-        impl_->set_action_state_locked(action, ActionState::ADMITTED);
+        (void)impl_->revive_for_admission_locked(action, true);
       }
     }
   }
@@ -277,6 +279,11 @@ MutationResult AgentRuntime::request_restore(CheckpointBindingId binding_id,
   if (state.lifecycle == RuntimeLifecycle::RETIRED) {
     return detail::reject(OutcomeCode::REJECT_RETIRED, subject, "runtime is retired");
   }
+  if (state.lifecycle == RuntimeLifecycle::COMPLETED ||
+      state.lifecycle == RuntimeLifecycle::FAILED) {
+    return detail::reject(OutcomeCode::REJECT_COMPLETED, subject,
+                          "a terminal runtime cannot restore into execution");
+  }
 
   record->state = CheckpointState::RESTORE_VALIDATED;
   for (CheckpointRecord& candidate : state.checkpoints) {
@@ -284,6 +291,10 @@ MutationResult AgentRuntime::request_restore(CheckpointBindingId binding_id,
       candidate.binding.current = false;
     }
   }
+  // In-flight attempts and unvalidated completions are superseded first, so an
+  // action whose side effect may already have happened stays ambiguous instead
+  // of becoming dispatchable again after the restore.
+  impl_->supersede_lost_work_locked("restore requested while the attempt was in flight");
   for (ActionRecord& action : state.actions) {
     if (action.state == ActionState::COMMITTED) {
       continue;
@@ -294,14 +305,6 @@ MutationResult AgentRuntime::request_restore(CheckpointBindingId binding_id,
     impl_->set_action_state_locked(action, ActionState::REVALIDATION_REQUIRED);
     action.current_attempt = ActionAttemptId{};
     action.current_attempt_generation = AttemptGeneration{};
-  }
-  for (AttemptRecord& attempt : state.attempts) {
-    if (is_in_flight(attempt.state)) {
-      attempt.superseded = true;
-      attempt.current = false;
-      impl_->set_attempt_state_locked(attempt, ActionState::REVALIDATION_REQUIRED);
-      attempt.error = "restore requested while the attempt was in flight";
-    }
   }
   state.lifecycle = RuntimeLifecycle::RECOVERING;
   state.recovery = RecoveryStatus::DURABLE_STATE_RESTORED;
@@ -336,6 +339,16 @@ MutationResult AgentRuntime::apply_restore(CheckpointBindingId binding_id,
     return detail::reject(OutcomeCode::REJECT_NOT_READY, subject,
                           "restore has not been validated for this checkpoint");
   }
+  if (state.cancellation != CancellationState::NONE ||
+      state.lifecycle == RuntimeLifecycle::CANCELLING ||
+      state.lifecycle == RuntimeLifecycle::CANCELLED) {
+    return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
+                          "the runtime was cancelled after the restore was validated");
+  }
+  if (is_terminal(state.lifecycle)) {
+    return detail::reject(OutcomeCode::REJECT_COMPLETED, subject,
+                          "the runtime became terminal after the restore was validated");
+  }
   record->state = CheckpointState::RESTORE_APPLIED;
   // A restore is a new authoritative generation, never a decrement of history.
   state.runtime_generation = state.runtime_generation.next();
@@ -362,16 +375,19 @@ MutationResult AgentRuntime::suspend(std::string reason) {
   }
   if (state.checkpoint_due) {
     state.lifecycle = RuntimeLifecycle::SUSPENDING;
-    return MutationResult(OutcomeCode::DEFERRED,
-                          ExplanationBuilder(OutcomeCode::DEFERRED, subject)
-                              .set_message("a required checkpoint must be accepted before suspension")
-                              .build());
+    return impl_->finish_locked(MutationResult(
+        OutcomeCode::DEFERRED,
+        ExplanationBuilder(OutcomeCode::DEFERRED, subject)
+            .set_message("a required checkpoint must be accepted before suspension")
+            .build()));
   }
 
   state.lifecycle = RuntimeLifecycle::SUSPENDING;
+  // Admitted and authorized work is suspended. Declared actions were never
+  // admitted: they stay declared, because resume returns suspended actions to
+  // ADMITTED and must not admit work that never passed admission.
   for (ActionRecord& action : state.actions) {
     switch (action.state) {
-      case ActionState::DECLARED:
       case ActionState::ADMITTED:
       case ActionState::AUTHORIZED:
         impl_->set_action_state_locked(action, ActionState::SUSPENDED);
@@ -395,11 +411,11 @@ MutationResult AgentRuntime::suspend(std::string reason) {
   }
 
   if (any_in_flight_locked(state)) {
-    return MutationResult(OutcomeCode::DEFERRED,
-                          ExplanationBuilder(OutcomeCode::DEFERRED, subject)
-                              .add("reason", reason)
-                              .set_message("in-flight work is still being classified")
-                              .build());
+    return impl_->finish_locked(
+        MutationResult(OutcomeCode::DEFERRED, ExplanationBuilder(OutcomeCode::DEFERRED, subject)
+                                                  .add("reason", reason)
+                                                  .set_message("in-flight work is still being classified")
+                                                  .build()));
   }
   state.lifecycle = RuntimeLifecycle::SUSPENDED;
   state.recovery = RecoveryStatus::NONE;
@@ -411,6 +427,42 @@ MutationResult AgentRuntime::suspend(std::string reason) {
 }
 
 MutationResult AgentRuntime::resume(const ResumeContext& context) {
+  // External providers are consulted before the canonical lock is taken: the
+  // class contract keeps every callback outside the critical section, and a
+  // provider may itself query this runtime.
+  AgentRuntimeId provider_runtime_id{};
+  BudgetId provider_budget_id{};
+  bool consult_scheduler = false;
+  std::vector<MemoryBinding> memory_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    provider_runtime_id = impl_->state.runtime_id;
+    provider_budget_id = impl_->state.budget.budget_id;
+    consult_scheduler = !context.assignment.has_value() &&
+                        impl_->state.policy.require_assignment_for_dispatch &&
+                        impl_->options.scheduler_authority != nullptr;
+    if (impl_->options.memory_provider != nullptr) {
+      memory_snapshot = impl_->state.memory_bindings;
+    }
+  }
+  std::optional<SchedulerAuthority> provided_assignment;
+  if (consult_scheduler) {
+    provided_assignment = impl_->options.scheduler_authority->current_assignment(provider_runtime_id);
+  }
+  std::vector<std::optional<MemoryBinding>> refreshed_memory;
+  refreshed_memory.reserve(memory_snapshot.size());
+  for (const MemoryBinding& binding : memory_snapshot) {
+    refreshed_memory.push_back(impl_->options.memory_provider->revalidate(binding));
+  }
+  std::optional<RuntimePolicy> provided_policy;
+  if (impl_->options.policy_provider != nullptr) {
+    provided_policy = impl_->options.policy_provider->current_policy(provider_runtime_id);
+  }
+  std::optional<BudgetEvidence> provided_budget;
+  if (impl_->options.budget_provider != nullptr) {
+    provided_budget = impl_->options.budget_provider->query(provider_runtime_id, provider_budget_id);
+  }
+
   std::lock_guard<std::mutex> lock(impl_->mutex);
   CanonicalState& state = impl_->state;
   const std::string subject = "runtime/" + std::to_string(state.runtime_id.value());
@@ -427,22 +479,31 @@ MutationResult AgentRuntime::resume(const ResumeContext& context) {
                           "completed runtime cannot resume");
   }
   // Recovery may already have installed the fresh incarnation; resuming under
-  // exactly that incarnation is legal. Any other boot must be strictly newer.
+  // exactly that incarnation is legal. Any other incarnation must be new in both
+  // boots: the previous one is fenced, so reusing its runtime boot would fence
+  // the resumed runtime itself.
   const bool same_incarnation = context.runtime_boot_id == state.runtime_boot_id &&
                                 context.agent_boot_id == state.agent_boot_id;
   if (!same_incarnation) {
-    if (context.runtime_boot_id < state.runtime_boot_id) {
+    if (context.runtime_boot_id <= state.runtime_boot_id) {
       return detail::reject(OutcomeCode::REJECT_STALE_RUNTIME_BOOT, subject,
-                            "resume runtime boot is older than the current boot");
+                            "resume runtime boot is not newer than the current boot");
     }
-    if (context.agent_boot_id < state.agent_boot_id) {
+    if (context.agent_boot_id <= state.agent_boot_id) {
       return detail::reject(OutcomeCode::REJECT_STALE_AGENT_BOOT, subject,
-                            "resume agent boot is older than the current boot");
+                            "resume agent boot is not newer than the current boot");
     }
   }
   if (context.runtime_epoch < state.runtime_epoch) {
     return detail::reject(OutcomeCode::REJECT_STALE_RUNTIME_EPOCH, subject,
                           "resume runtime epoch is older than the current epoch");
+  }
+  if (same_incarnation && state.recovery != RecoveryStatus::BINDINGS_RECONSTRUCTED) {
+    // Only recover() installs an incarnation that resume may adopt. A loaded or
+    // suspended runtime still carries the incarnation that wrote it.
+    return detail::reject(OutcomeCode::REJECT_STALE_RUNTIME_BOOT, subject,
+                          "resume requires fresh process authority: the current incarnation "
+                          "was not installed by recovery");
   }  if (!can_resume(state.lifecycle) && state.lifecycle != RuntimeLifecycle::READY) {
     return detail::reject(OutcomeCode::REJECT_NOT_RESUMABLE, subject,
                           std::string("runtime lifecycle ") + std::string(to_string(state.lifecycle)) +
@@ -492,60 +553,74 @@ MutationResult AgentRuntime::resume(const ResumeContext& context) {
     record.current = true;
     record.reason = "resume";
     record.recorded_at_unix_millis = impl_->now_unix();
+    if (state.assignments.size() >= impl_->limits.max_assignment_history) {
+      state.assignments.erase(state.assignments.begin());
+    }
     state.assignments.push_back(std::move(record));
     state.current_assignment = supplied;
     state.current_assignment.current = true;
     state.has_assignment = true;
   } else if (state.policy.require_assignment_for_dispatch) {
-    if (impl_->options.scheduler_authority != nullptr) {
-      std::optional<SchedulerAuthority> fresh =
-          impl_->options.scheduler_authority->current_assignment(state.runtime_id);
-      if (!fresh.has_value()) {
+    if (consult_scheduler) {
+      if (!provided_assignment.has_value()) {
         state.lifecycle = RuntimeLifecycle::REVALIDATION_REQUIRED;
-        return detail::reject(OutcomeCode::REJECT_STALE_ASSIGNMENT, subject,
-                              "no current scheduler assignment is available for resume");
+        return impl_->finish_locked(
+            detail::reject(OutcomeCode::REJECT_STALE_ASSIGNMENT, subject,
+                           "no current scheduler assignment is available for resume"));
       }
-      state.current_assignment = *fresh;
+      state.current_assignment = *provided_assignment;
       state.current_assignment.current = true;
       state.has_assignment = true;
     } else if (!state.has_assignment || !state.current_assignment.current) {
       state.lifecycle = RuntimeLifecycle::REVALIDATION_REQUIRED;
-      return detail::reject(OutcomeCode::REJECT_STALE_ASSIGNMENT, subject,
-                            "policy requires an assignment and none is current");
+      return impl_->finish_locked(
+          detail::reject(OutcomeCode::REJECT_STALE_ASSIGNMENT, subject,
+                         "policy requires an assignment and none is current"));
     }
   }
 
-  // Revalidate bindings through the configured providers where available.
-  if (impl_->options.memory_provider != nullptr) {
+  // Revalidate bindings through the configured providers where available. A
+  // provider answer applies only to the binding it was asked about; a binding
+  // installed or moved while the provider ran keeps its newer authority.
+  for (std::size_t index = 0; index < memory_snapshot.size(); ++index) {
+    const MemoryBinding& asked = memory_snapshot[index];
     for (MemoryBinding& binding : state.memory_bindings) {
-      std::optional<MemoryBinding> refreshed =
-          impl_->options.memory_provider->revalidate(binding);
-      if (!refreshed.has_value()) {
+      if (binding.binding_id != asked.binding_id || binding.generation != asked.generation ||
+          binding.external_generation != asked.external_generation) {
+        continue;
+      }
+      if (!refreshed_memory[index].has_value()) {
         binding.fresh = false;
         binding.read_authority = false;
         binding.write_authority = false;
       } else {
-        binding = *refreshed;
+        binding = *refreshed_memory[index];
       }
+      break;
     }
   }
-  if (impl_->options.policy_provider != nullptr) {
-    std::optional<RuntimePolicy> refreshed =
-        impl_->options.policy_provider->current_policy(state.runtime_id);
+  if (provided_policy.has_value()) {
+    std::optional<RuntimePolicy> refreshed = std::move(provided_policy);
     if (refreshed.has_value()) {
       const std::string error = refreshed->validate();
       if (error.empty() && refreshed->generation >= state.policy.generation) {
         state.policy = *refreshed;
+        if (state.policy_history.size() >= impl_->limits.max_policy_records) {
+          state.policy_history.erase(state.policy_history.begin());
+        }
         state.policy_history.push_back(*refreshed);
       }
     }
   }
-  if (impl_->options.budget_provider != nullptr) {
-    BudgetEvidence evidence = impl_->options.budget_provider->query(state.runtime_id, state.budget.budget_id);
+  if (provided_budget.has_value()) {
+    const BudgetEvidence& evidence = *provided_budget;
     if (evidence.budget_id.valid() && evidence.generation.valid() &&
         (!state.has_budget || evidence.generation >= state.budget.generation)) {
       state.budget = evidence;
       state.has_budget = true;
+      if (state.budget_history.size() >= impl_->limits.max_budget_records) {
+        state.budget_history.erase(state.budget_history.begin());
+      }
       state.budget_history.push_back(evidence);
     }
   }
@@ -608,12 +683,21 @@ MutationResult AgentRuntime::resume(const ResumeContext& context) {
     if (action.state == ActionState::COMMITTED || is_terminal(action.state)) {
       continue;
     }
+    if (action.state == ActionState::DECLARED) {
+      // Declared work stays declared (it was never admitted) but belongs to the
+      // new incarnation, so that it can still be admitted and authorized.
+      action.runtime_boot_id = state.runtime_boot_id;
+      action.runtime_epoch = state.runtime_epoch;
+      action.coordinator_epoch = state.coordinator_epoch;
+      continue;
+    }
     if (action.ambiguous || action.state == ActionState::REVALIDATION_REQUIRED) {
       if (action.ambiguous) {
         ++held;
         continue;
       }
-      impl_->set_action_state_locked(action, ActionState::ADMITTED);
+      // Beyond the active-action bound an action keeps waiting for admission.
+      (void)impl_->revive_for_admission_locked(action, false);
       action.runtime_boot_id = state.runtime_boot_id;
       action.runtime_epoch = state.runtime_epoch;
       action.coordinator_epoch = state.coordinator_epoch;
@@ -624,8 +708,9 @@ MutationResult AgentRuntime::resume(const ResumeContext& context) {
         is_in_flight(action.state) || action.state == ActionState::COMPLETED_UNVALIDATED) {
       if (is_in_flight(action.state)) {
         impl_->set_action_state_locked(action, ActionState::RETRY_PENDING);
-      } else if (action.state == ActionState::SUSPENDED) {
-        impl_->set_action_state_locked(action, ActionState::ADMITTED);
+      } else if (action.state == ActionState::SUSPENDED &&
+                 !impl_->revive_for_admission_locked(action, false)) {
+        impl_->set_action_state_locked(action, ActionState::REVALIDATION_REQUIRED);
       }
       action.runtime_boot_id = state.runtime_boot_id;
       action.runtime_epoch = state.runtime_epoch;
@@ -651,13 +736,14 @@ MutationResult AgentRuntime::resume(const ResumeContext& context) {
   if (needs_revalidation) {
     state.lifecycle = RuntimeLifecycle::REVALIDATION_REQUIRED;
     state.recovery = RecoveryStatus::BINDINGS_RECONSTRUCTED;
-    return MutationResult(OutcomeCode::REVALIDATION_REQUIRED,
-                          ExplanationBuilder(OutcomeCode::REVALIDATION_REQUIRED, subject)
-                              .add("reason", revalidation_reason)
-                              .add_u64("resumed_actions", resumed)
-                              .add_u64("held_actions", held)
-                              .set_message("resume requires binding revalidation")
-                              .build());
+    return impl_->finish_locked(
+        MutationResult(OutcomeCode::REVALIDATION_REQUIRED,
+                       ExplanationBuilder(OutcomeCode::REVALIDATION_REQUIRED, subject)
+                           .add("reason", revalidation_reason)
+                           .add_u64("resumed_actions", resumed)
+                           .add_u64("held_actions", held)
+                           .set_message("resume requires binding revalidation")
+                           .build()));
   }
   state.lifecycle = state.current_run_index != kInvalidIndex &&
                             !state.runs[state.current_run_index].terminal
@@ -798,31 +884,47 @@ MutationResult AgentRuntime::drain() {
   if (state.lifecycle == RuntimeLifecycle::FAILED) {
     return detail::reject(OutcomeCode::REJECT_COMPLETED, subject, "runtime has failed");
   }
+  if (state.cancellation != CancellationState::NONE) {
+    return detail::reject(OutcomeCode::REJECT_CANCELLED, subject, "runtime is cancelled");
+  }
 
+  // Authorized actions finish during the drain when the policy waits for them
+  // (DRAINING still dispatches them); otherwise they never ran and are cancelled
+  // with the rest of the undispatched work.
+  const bool waits_for_authorized = state.policy.drain_waits_for_authorized_actions;
   state.lifecycle = RuntimeLifecycle::DRAINING;
   for (ActionRecord& action : state.actions) {
     if (action.state == ActionState::DECLARED || action.state == ActionState::ADMITTED ||
-        action.state == ActionState::RETRY_PENDING) {
+        action.state == ActionState::RETRY_PENDING ||
+        (!waits_for_authorized && action.state == ActionState::AUTHORIZED)) {
       impl_->set_action_state_locked(action, ActionState::CANCELLED);
       action.current_attempt = ActionAttemptId{};
       action.current_attempt_generation = AttemptGeneration{};
     }
   }
 
-  const bool pending = state.policy.drain_waits_for_authorized_actions
-                           ? any_pending_authorized_locked(state)
-                           : any_in_flight_locked(state);
+  const bool pending = waits_for_authorized ? any_pending_authorized_locked(state)
+                                            : any_in_flight_locked(state);
   if (pending) {
-    return MutationResult(OutcomeCode::DEFERRED,
-                          ExplanationBuilder(OutcomeCode::DEFERRED, subject)
-                              .set_message("draining: already-authorized obligations remain")
-                              .build());
+    return impl_->finish_locked(
+        MutationResult(OutcomeCode::DEFERRED,
+                       ExplanationBuilder(OutcomeCode::DEFERRED, subject)
+                           .set_message("draining: already-authorized obligations remain")
+                           .build()));
   }
   if (state.checkpoint_due) {
-    return MutationResult(OutcomeCode::DEFERRED,
-                          ExplanationBuilder(OutcomeCode::DEFERRED, subject)
-                              .set_message("draining: a required checkpoint must be accepted")
-                              .build());
+    return impl_->finish_locked(
+        MutationResult(OutcomeCode::DEFERRED,
+                       ExplanationBuilder(OutcomeCode::DEFERRED, subject)
+                           .set_message("draining: a required checkpoint must be accepted")
+                           .build()));
+  }
+  if (count_ambiguous_locked(state) != 0) {
+    return impl_->finish_locked(MutationResult(
+        OutcomeCode::MANUAL_OR_EXTERNAL_RECONCILIATION_REQUIRED,
+        ExplanationBuilder(OutcomeCode::MANUAL_OR_EXTERNAL_RECONCILIATION_REQUIRED, subject)
+            .set_message("draining: ambiguous side effects must be reconciled before completion")
+            .build()));
   }
 
   state.lifecycle = RuntimeLifecycle::COMPLETED;
@@ -854,7 +956,8 @@ MutationResult AgentRuntime::complete(std::string reason) {
   const std::string subject = "runtime/" + std::to_string(state.runtime_id.value());
 
   if (state.lifecycle == RuntimeLifecycle::CANCELLED ||
-      state.lifecycle == RuntimeLifecycle::CANCELLING) {
+      state.lifecycle == RuntimeLifecycle::CANCELLING ||
+      state.cancellation != CancellationState::NONE) {
     return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
                           "a cancelled runtime must not report completion");
   }
@@ -876,6 +979,23 @@ MutationResult AgentRuntime::complete(std::string reason) {
                           "ambiguous side effects must be reconciled before completion");
   }
 
+  // Work that never started is cancelled: a completed runtime keeps no
+  // admitted or authorized action that could still be dispatched.
+  for (ActionRecord& action : state.actions) {
+    switch (action.state) {
+      case ActionState::DECLARED:
+      case ActionState::ADMITTED:
+      case ActionState::AUTHORIZED:
+      case ActionState::RETRY_PENDING:
+      case ActionState::SUSPENDED:
+        impl_->set_action_state_locked(action, ActionState::CANCELLED);
+        action.current_attempt = ActionAttemptId{};
+        action.current_attempt_generation = AttemptGeneration{};
+        break;
+      default:
+        break;
+    }
+  }
   state.lifecycle = RuntimeLifecycle::COMPLETED;
   state.terminal_reason = std::move(reason);
   if (state.current_run_index != kInvalidIndex) {
@@ -923,12 +1043,25 @@ MutationResult AgentRuntime::fail(std::string reason) {
     if (is_in_flight(attempt.state)) {
       attempt.superseded = true;
       attempt.current = false;
+      const std::uint32_t index = detail::find_action(state, attempt.action_id);
+      if (index != kInvalidIndex &&
+          requires_reconciliation_on_ambiguity(state.actions[index].side_effect)) {
+        // The runtime failing does not prove that the side effect did not
+        // happen: the action is recorded as ambiguous, never as failed.
+        impl_->set_attempt_state_locked(attempt, ActionState::REVALIDATION_REQUIRED);
+        attempt.ambiguous = true;
+        attempt.completion_status = CompletionStatus::AMBIGUOUS;
+        attempt.error = "runtime failed while the attempt was in flight";
+        impl_->hold_ambiguous_locked(state.actions[index], attempt.error);
+        continue;
+      }
       impl_->set_attempt_state_locked(attempt, ActionState::FAILED);
       attempt.error = "runtime failed";
     }
   }
+  impl_->hold_unvalidated_completions_locked();
   for (ActionRecord& action : state.actions) {
-    if (!action.committed && !is_terminal(action.state)) {
+    if (!action.committed && !is_terminal(action.state) && !action.ambiguous) {
       impl_->set_action_state_locked(action, ActionState::FAILED);
       action.last_failure = RetryClass::UNKNOWN;
     }
@@ -957,6 +1090,7 @@ MutationResult AgentRuntime::retire() {
                           "runtime must be terminal before retirement");
   }
   state.lifecycle = RuntimeLifecycle::RETIRED;
+  state.recovery = RecoveryStatus::NONE;
   detail::record_provenance(state, *impl_->clock, "retire", "runtime retired");
   return impl_->finish_locked(detail::accepted(subject, "runtime retired"));
 }
@@ -974,9 +1108,15 @@ MutationResult AgentRuntime::recover(const RecoveryContext& context) {
   if (state.lifecycle == RuntimeLifecycle::RETIRED) {
     return detail::reject(OutcomeCode::REJECT_RETIRED, subject, "retired runtime cannot recover");
   }
-  if (state.lifecycle == RuntimeLifecycle::CANCELLED) {
+  if (state.lifecycle == RuntimeLifecycle::CANCELLED ||
+      state.cancellation != CancellationState::NONE) {
     return detail::reject(OutcomeCode::REJECT_CANCELLED, subject,
                           "cancelled runtime cannot recover into execution");
+  }
+  if (state.lifecycle == RuntimeLifecycle::COMPLETED ||
+      state.lifecycle == RuntimeLifecycle::FAILED) {
+    return detail::reject(OutcomeCode::REJECT_COMPLETED, subject,
+                          "a terminal runtime cannot recover into execution");
   }
   if (context.runtime_boot_id <= state.runtime_boot_id) {
     return detail::reject(OutcomeCode::REJECT_STALE_RUNTIME_BOOT, subject,
@@ -1048,6 +1188,10 @@ MutationResult AgentRuntime::recover(const RecoveryContext& context) {
     impl_->classify_unresolved_locked(state.actions[index], attempt,
                                       "process authority was lost while the attempt was in flight");
   }
+  // A completion that was recorded but never committed cannot be committed
+  // under the new incarnation; when the effect cannot be repeated safely the
+  // action is held as ambiguous instead of becoming dispatchable again.
+  impl_->hold_unvalidated_completions_locked();
   for (ActionRecord& action : state.actions) {
     if (is_in_flight(action.state) || action.state == ActionState::COMPLETED_UNVALIDATED) {
       impl_->set_action_state_locked(action, ActionState::REVALIDATION_REQUIRED);
